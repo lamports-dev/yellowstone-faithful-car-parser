@@ -1,13 +1,17 @@
 use {
     anyhow::Context,
     clap::Parser,
+    futures::future::{BoxFuture, FutureExt, pending},
     indicatif::{MultiProgress, ProgressBar, ProgressStyle},
     prost::Message,
     serde::Deserialize,
     solana_sdk::transaction::{TransactionError, VersionedTransaction},
     solana_storage_proto::convert::generated,
-    tokio::{fs::File, io::BufReader},
-    yellowstone_faithful_car_parser::node::{Node, NodeReader, Nodes},
+    std::collections::VecDeque,
+    tokio::{fs::File, io::BufReader, sync::mpsc, task::spawn_blocking},
+    yellowstone_faithful_car_parser::node::{
+        Node, NodeError, NodeReader, NodeWithCid, Nodes, RawNode,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -51,10 +55,37 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut bar = ReaderProgressBar::new(args.decode);
+    let (read_tx, read_rx) = mpsc::channel(32_768);
+    let (node_tx, mut node_rx) = mpsc::channel(32_768);
+    tokio::spawn(async move {
+        loop {
+            let msg = match reader.read_node().await {
+                Ok(Some(node)) => Ok(node),
+                Ok(None) => break,
+                Err(error) => Err(error),
+            };
+            if read_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(read_and_parse(read_rx, node_tx, 128));
+
     let mut next_slot = None;
+    let mut bar = ReaderProgressBar::new(args.decode);
     loop {
-        let nodes = Nodes::read_until_block(&mut reader).await?;
+        let mut nodes = Nodes::default();
+        let mut finished = false;
+        while !finished {
+            let node = match node_rx.recv().await {
+                Some(Ok(node)) => node,
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
+            };
+            finished = matches!(node.node, Node::Block(_));
+            nodes.push(node);
+        }
+        // let nodes = Nodes::read_until_block(&mut reader).await?;
         if nodes.nodes.is_empty() {
             break;
         }
@@ -306,4 +337,61 @@ struct StoredTransactionStatusMeta {
 struct StoredBlockReward {
     pubkey: String,
     lamports: i64,
+}
+
+async fn read_and_parse(
+    rx: mpsc::Receiver<Result<RawNode, NodeError>>,
+    tx: mpsc::Sender<Result<NodeWithCid, NodeError>>,
+    buffer_size: usize,
+) {
+    let mut queue: VecDeque<
+        BoxFuture<'static, Result<Result<NodeWithCid, NodeError>, tokio::task::JoinError>>,
+    > = VecDeque::with_capacity(buffer_size);
+
+    let node_fut = pending().boxed();
+    tokio::pin!(node_fut);
+    let mut node_fut_assigned = false;
+
+    let mut rx = Some(rx);
+    while rx.is_some() {
+        let rx_fut = match &mut rx {
+            Some(rx) if queue.len() < buffer_size => rx.recv().boxed(),
+            _ => pending().boxed(),
+        };
+
+        if !node_fut_assigned {
+            if let Some(fut) = queue.pop_front() {
+                node_fut.set(fut.boxed());
+                node_fut_assigned = true;
+            }
+        }
+
+        tokio::select! {
+            recv_msg = rx_fut => match recv_msg {
+                Some(msg) => {
+                    queue.push_back(spawn_blocking(move || NodeWithCid::try_from(&(msg?))).boxed());
+                },
+                None => {
+                    rx = None;
+                }
+            },
+            msg = &mut node_fut => {
+                tx.send(msg.expect("failed to join spawned task")).await.expect("failed to send a msg");
+                node_fut.set(pending().boxed());
+                node_fut_assigned = false;
+            }
+        };
+    }
+
+    if node_fut_assigned {
+        tx.send(node_fut.await.expect("failed to join spawned task"))
+            .await
+            .expect("failed to send a msg");
+    }
+
+    while let Some(node_fut) = queue.pop_front() {
+        tx.send(node_fut.await.expect("failed to join spawned task"))
+            .await
+            .expect("failed to send a msg");
+    }
 }
