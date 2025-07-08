@@ -33,6 +33,9 @@ solana-transaction-status = { version = "~2.2.19", optional = true }
 thiserror = "2.0.11"
 tokio = { version = "1.46.1", default-features = false, features = ["io-util"] }
 zstd = { version = "0.13.3", optional = true }
+#
+pin-project-lite = "0.2.16"
+futures = "0.3.31"
 
 [dev-dependencies]
 const-hex = "1.14.1"

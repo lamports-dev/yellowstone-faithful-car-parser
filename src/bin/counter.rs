@@ -1,13 +1,28 @@
 use {
-    anyhow::Context,
+    anyhow::Context as _,
     clap::Parser,
+    futures::{
+        future::BoxFuture,
+        stream::{Stream, StreamExt},
+    },
     indicatif::{MultiProgress, ProgressBar, ProgressStyle},
     prost::Message,
     serde::Deserialize,
     solana_sdk::transaction::{TransactionError, VersionedTransaction},
     solana_storage_proto::convert::generated,
-    tokio::{fs::File, io::BufReader},
-    yellowstone_faithful_car_parser::node::{Node, NodeReader, Nodes},
+    std::{
+        collections::VecDeque,
+        pin::Pin,
+        task::{Context, Poll},
+    },
+    tokio::{
+        fs::File,
+        io::{AsyncRead, BufReader},
+        task::{JoinError, JoinHandle, spawn_blocking},
+    },
+    yellowstone_faithful_car_parser::node::{
+        Node, NodeError, NodeReader, NodeWithCid, Nodes, RawNode,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -51,10 +66,23 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut bar = ReaderProgressBar::new(args.decode);
+    let mut reader = ParallelParser::new(reader, 1024);
     let mut next_slot = None;
+    let mut bar = ReaderProgressBar::new(args.decode);
     loop {
-        let nodes = Nodes::read_until_block(&mut reader).await?;
+        let mut nodes = Nodes::default();
+        let mut finished = false;
+        while !finished {
+            let node = match reader.next().await {
+                Some(Ok(node)) => node,
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
+            };
+            finished = matches!(node.node, Node::Block(_));
+            nodes.push(node);
+        }
+
+        // let nodes = Nodes::read_until_block(&mut reader).await?;
         if nodes.nodes.is_empty() {
             break;
         }
@@ -306,4 +334,87 @@ struct StoredTransactionStatusMeta {
 struct StoredBlockReward {
     pubkey: String,
     lamports: i64,
+}
+
+pin_project_lite::pin_project! {
+    struct ParallelParser<R> {
+        reader: Option<NodeReader<R>>,
+        #[pin]
+        raw_node_fut: Option<BoxFuture<'static, (NodeReader<R>, Result<Option<RawNode>, NodeError>)>>,
+
+        node_futs_max: usize,
+        node_futs: VecDeque<JoinHandle<Result<NodeWithCid, NodeError>>>,
+        #[pin]
+        node_fut: Option<BoxFuture<'static, Result<Result<NodeWithCid, NodeError>, JoinError>>>,
+    }
+}
+
+impl<R> ParallelParser<R> {
+    fn new(reader: NodeReader<R>, node_futs_max: usize) -> Self {
+        Self {
+            reader: Some(reader),
+            raw_node_fut: None,
+            node_futs_max,
+            node_futs: VecDeque::with_capacity(node_futs_max),
+            node_fut: None,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + 'static> Stream for ParallelParser<R> {
+    type Item = Result<NodeWithCid, NodeError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        while this.node_futs.len() < *this.node_futs_max {
+            if let Some(mut reader) = this.reader.take() {
+                *this.raw_node_fut = Some(Box::pin(async move {
+                    let result = reader.read_node().await;
+                    (reader, result)
+                }));
+            }
+            if let Some(mut fut) = this.raw_node_fut.take() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready((reader, result)) => match result {
+                        Ok(Some(node)) => {
+                            *this.reader = Some(reader);
+                            this.node_futs
+                                .push_back(spawn_blocking(move || NodeWithCid::try_from(&node)));
+                        }
+                        Ok(None) => break,
+                        Err(error) => return Poll::Ready(Some(Err(error))),
+                    },
+                    Poll::Pending => {
+                        *this.raw_node_fut = Some(fut);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if this.node_fut.is_none() {
+            match this.node_futs.pop_front() {
+                Some(fut) => *this.node_fut = Some(Box::pin(fut)),
+                None => {
+                    if this.reader.is_none() && this.raw_node_fut.is_none() {
+                        return Poll::Ready(None);
+                    }
+                }
+            }
+        }
+
+        if let Some(mut fut) = this.node_fut.take() {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    return Poll::Ready(Some(result.expect("failed to join spawned task")));
+                }
+                Poll::Pending => {
+                    *this.node_fut = Some(fut);
+                }
+            }
+        }
+
+        Poll::Pending
+    }
 }
